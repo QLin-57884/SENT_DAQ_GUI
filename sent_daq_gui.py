@@ -14,12 +14,13 @@ from nidaqmx.constants import AcquisitionType, LineGrouping
 import threading
 import time
 import csv
+from queue import Queue, Full
 
 # === Config === #
 DEVICE_NAME = "Dev1"
 LINE_NAME = "port0/line0"
 SAMPLE_RATE = 2_000_000
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 20000  # adjusted for ~10ms resolution
 BUFFER_DURATION_SEC = 2
 BUFFER_SIZE = SAMPLE_RATE * BUFFER_DURATION_SEC
 
@@ -27,13 +28,14 @@ BUFFER_SIZE = SAMPLE_RATE * BUFFER_DURATION_SEC
 rolling_buffer = np.zeros(BUFFER_SIZE, dtype=int)
 is_running = False
 acq_thread = None
+decode_thread = None
 
 # === GUI App === #
 class SentDAQApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SENT Signal Acquisition GUI")
-        self.root.geometry("1200x800")  # Make the window bigger
+        self.root.geometry("1200x800")
 
         self.start_button = ttk.Button(root, text="Start", command=self.start_acquisition)
         self.stop_button = ttk.Button(root, text="Stop", command=self.stop_acquisition, state='disabled')
@@ -45,8 +47,7 @@ class SentDAQApp:
         self.save_button.grid(row=0, column=2, padx=10, pady=10)
         self.exit_button.grid(row=0, column=3, padx=10, pady=10)
 
-        # Setup plot
-        self.fig, self.ax = plt.subplots(figsize=(12, 4))  # Bigger plot size
+        self.fig, self.ax = plt.subplots(figsize=(12, 4))
         self.line, = self.ax.step(np.arange(BUFFER_SIZE) / SAMPLE_RATE * 1e3, rolling_buffer, where='post')
         self.ax.set_ylim(-0.2, 1.2)
         self.ax.set_xlim(0, BUFFER_SIZE / SAMPLE_RATE * 1e3)
@@ -62,15 +63,18 @@ class SentDAQApp:
         self.prev_chunk = np.array([], dtype=int)
         self.decoding_active = False
         self.sync_index_in_ticks = 0
+        self.data_queue = Queue(maxsize=200)
 
     def start_acquisition(self):
-        global is_running, acq_thread
+        global is_running, acq_thread, decode_thread
         is_running = True
         self.start_button.config(state='disabled')
         self.stop_button.config(state='normal')
         self.save_button.config(state='normal')
         acq_thread = threading.Thread(target=self.acquisition_loop, daemon=True)
+        decode_thread = threading.Thread(target=self.decode_worker, daemon=True)
         acq_thread.start()
+        decode_thread.start()
         self.update_plot()
 
     def stop_acquisition(self):
@@ -94,11 +98,13 @@ class SentDAQApp:
                     new_data = task.read(number_of_samples_per_channel=CHUNK_SIZE, timeout=10.0)
                     new_data = np.array(new_data, dtype=int)
 
-                    # Merge with leftover from last chunk
                     combined_data = np.concatenate((self.prev_chunk, new_data))
                     self.prev_chunk = new_data[-1000:]
 
-                    self.decode_sent_chunk(combined_data)
+                    try:
+                        self.data_queue.put(combined_data, timeout=0.01)
+                    except Full:
+                        print("⚠️ Queue full — dropped a chunk!")
 
                     rolling_buffer = np.roll(rolling_buffer, -len(new_data))
                     rolling_buffer[-len(new_data):] = new_data
@@ -111,6 +117,12 @@ class SentDAQApp:
             self.line.set_ydata(rolling_buffer)
             self.canvas.draw()
             self.root.after(50, self.update_plot)
+
+    def decode_worker(self):
+        while is_running:
+            if not self.data_queue.empty():
+                chunk = self.data_queue.get()
+                self.decode_sent_chunk(chunk)
 
     def decode_sent_chunk(self, signal_chunk, sampling_rate=1/2_000_000):
         tick_time = 3.0e-6
