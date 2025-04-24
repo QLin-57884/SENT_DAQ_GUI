@@ -3,7 +3,7 @@
 Created on Tue Apr 22 12:15:23 2025
 
 @author: QLin
-Updated: Counter-based SENT timestamp capture & decode with CRC validation
+Updated: Counter-based SENT timestamp capture & decode with CRC validation and chunk boundary handling
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -89,8 +89,10 @@ class SentTimestampApp:
         self.data_queue = Queue(maxsize=QUEUE_MAX_CHUNKS)
         self.ui_queue   = Queue(maxsize=QUEUE_MAX_CHUNKS)
 
-        # Decode state
+        # Decode state and leftovers
         self.decoding_active = False
+        self.leftover_ticks0 = np.array([], dtype=int)
+        self.leftover_ticks1 = np.array([], dtype=int)
         self.sync_index = 0
 
     def start_acquisition(self):
@@ -135,54 +137,62 @@ class SentTimestampApp:
                 ts0, ts1 = self.data_queue.get(timeout=0.1)
             except:
                 continue
+
+            # Compute ticks for this batch
             dt0 = np.diff(ts0) * 1e6
             dt1 = np.diff(ts1) * 1e6
             ticks0 = np.round(dt0 / tick_us).astype(int)
             ticks1 = np.round(dt1 / tick_us).astype(int)
 
-            # Sync - find first sync on channel 0
+            # Prepend leftover ticks from previous batch
+            ticks0 = np.concatenate([self.leftover_ticks0, ticks0])
+            ticks1 = np.concatenate([self.leftover_ticks1, ticks1])
+
+            # Decode frames
+            i = 0
+            # Find sync if not already aligned
             if not self.decoding_active:
-                idxs = np.where(ticks0 == 56)[0]
-                if len(idxs) > 0:
+                sync_idxs = np.where(ticks0 == 56)[0]
+                if sync_idxs.size:
                     self.decoding_active = True
-                    self.sync_index = idxs[0]
-                else:
-                    continue
+                    i = sync_idxs[0]
 
-            i = self.sync_index
-            # Extract status + 6 data + CRC for both channels
-            status0 = ticks0[i+1] - zero_ticks
-            status1 = ticks1[i+1] - zero_ticks
-            data_nibbles0 = [(ticks0[i+2+k] - zero_ticks) for k in range(6)]
-            data_nibbles1 = [(ticks1[i+2+k] - zero_ticks) for k in range(6)]
-            crc_tick0 = ticks0[i+8] - zero_ticks
-            crc_tick1 = ticks1[i+8] - zero_ticks
+            while self.decoding_active and (i + 8) < len(ticks0):
+                # Extract status, data and CRC
+                status0 = ticks0[i+1] - zero_ticks
+                status1 = ticks1[i+1] - zero_ticks
+                data0 = [(ticks0[i+2+k] - zero_ticks) for k in range(6)]
+                data1 = [(ticks1[i+2+k] - zero_ticks) for k in range(6)]
+                crc0   = ticks0[i+8] - zero_ticks
+                crc1   = ticks1[i+8] - zero_ticks
 
-            # Compute sensor values
-            s1 = (data_nibbles0[0] << 8) | (data_nibbles0[1] << 4) | data_nibbles0[2]
-            s2 = (data_nibbles1[0] << 8) | (data_nibbles1[1] << 4) | data_nibbles1[2]
+                # Sensor values
+                s1 = (data0[0] << 8) | (data0[1] << 4) | data0[2]
+                s2 = (data1[0] << 8) | (data1[1] << 4) | data1[2]
 
-            # Validate CRC
-            expected_crc0 = compute_crc4([status0] + data_nibbles0)
-            expected_crc1 = compute_crc4([status1] + data_nibbles1)
-            ok0 = (crc_tick0 == expected_crc0)
-            ok1 = (crc_tick1 == expected_crc1)
+                # CRC validation
+                exp0 = compute_crc4([status0] + data0)
+                exp1 = compute_crc4([status1] + data1)
+                ok0 = (crc0 == exp0)
+                ok1 = (crc1 == exp1)
 
-            line = (
+                line = (
                     f"[Live] S1={s1}, S2={s2}, "
-                    f"CRC0={crc_tick0:1X}({'OK' if ok0 else 'ERR'}), "
-                    f"CRC1={crc_tick1:1X}({'OK' if ok1 else 'ERR'})\n"
-            )
+                    f"CRC0={crc0:1X}({'OK' if ok0 else 'ERR'}), "
+                    f"CRC1={crc1:1X}({'OK' if ok1 else 'ERR'})\n"
+                )
+                try:
+                    self.ui_queue.put(line, timeout=0.01)
+                except Full:
+                    print("⚠️ UI queue full — dropping line")
 
-            try:
-                self.ui_queue.put(line, timeout=0.01)
-            except Full:
-                print("⚠️ UI queue full — dropping line")
+                # Advance to the next frame
+                i += 9
 
-            # Advance to next frame (9 events)
-            i += 9
-            if i + 8 >= len(ticks0):
-                self.decoding_active = False
+            # Save leftovers (< one frame) for next batch
+            self.leftover_ticks0 = ticks0[i:]
+            self.leftover_ticks1 = ticks1[i:]
+            self.decoding_active = False
 
     def gui_loop(self):
         while is_running:
@@ -194,10 +204,10 @@ class SentTimestampApp:
 
     def _insert_line(self, line):
         self.decode_box.insert(tk.END, line)
-        # limit display
-        lines = int(self.decode_box.index('end-1c').split('.')[0])
-        if lines > MAX_DISPLAY_LINES:
-            self.decode_box.delete('1.0', f"{lines-MAX_DISPLAY_LINES+1}.0")
+        # limit display size
+        total = int(self.decode_box.index('end-1c').split('.')[0])
+        if total > MAX_DISPLAY_LINES:
+            self.decode_box.delete('1.0', f"{total-MAX_DISPLAY_LINES+1}.0")
 
     def save_data(self):
         filename = filedialog.asksaveasfilename(defaultextension=".csv",
@@ -208,7 +218,7 @@ class SentTimestampApp:
             lines = self.decode_box.get('1.0', tk.END).strip().splitlines()
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Decoded SENT frames with CRC"])  
+                writer.writerow(["Decoded SENT frames with CRC"])
                 for l in lines:
                     writer.writerow([l])
             messagebox.showinfo("Saved", f"Decoded data saved to {filename}")
